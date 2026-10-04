@@ -107,7 +107,7 @@ curl -sS -X POST "${BASE_URL}/records/${RID2}/publish" "${AUTH[@]}" -d '{"versio
 printf '后续补设窗口: HTTP %s\n' "$(code -X POST "${BASE_URL}/records/${RID2}/publish" "${AUTH[@]}" \
   -d "{\"version\":1,\"window_open_at\":\"${OPEN_SOON}\",\"window_close_at\":\"${CLOSE_LATER}\"}")"
 
-step "9. 受控发布：申请随版本冻结窗口，批准时截止已到则拒绝批准（仍待审、可驳回）"
+step "9. 受控发布：申请随版本冻结窗口，批准时（即使在数据库行锁上等待后）截止已到则拒绝批准（不生成快照/令牌，仍待审、可驳回）"
 CREATE3=$(curl -sS -X POST "${BASE_URL}/records" "${AUTH[@]}" \
   -d '{"text": "受控记录原文。", "intervals": []}')
 RID3=$(echo "${CREATE3}" | jq -r .record_id)

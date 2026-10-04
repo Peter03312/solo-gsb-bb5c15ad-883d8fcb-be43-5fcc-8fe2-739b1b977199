@@ -2,7 +2,8 @@
 # 受控发布（申请-复核）端到端示例：
 #   标记受控 -> 直接发布被拒 -> 个人凭据申请 -> 申请人不得复核 ->
 #   冻结版本内容 -> 复核人批准(同事务快照+令牌) -> 公开读取 ->
-#   驳回后不能批准 -> 并发复核只有一个终态 -> 撤销令牌
+#   驳回后不能批准 -> 并发复核只有一个终态 -> 撤销令牌 ->
+#   冻结阅览时段在等待行锁期间截止：批准 409、不出快照/令牌、仍可驳回
 # 依赖：curl、jq
 set -euo pipefail
 
@@ -118,5 +119,35 @@ curl -sS "${BASE_URL}/records/${RECORD_ID}/publish-requests" -u "alice:${ALICE_P
 step "15. 批准签发的令牌走既有撤销接口，撤销后公开读取 403"
 curl -sS -X POST "${BASE_URL}/tokens/${TOKEN}/revoke" "${AUTH[@]}" | jq .
 curl -sS "${BASE_URL}/public/snapshots/${SNAPSHOT_ID}?token=${TOKEN}" | jq .
+
+step "16. 冻结阅览时段在等待复核期间截止：批准 409，不生成快照/令牌，申请仍待审、可驳回"
+# 新建一条受控记录，提交一个约 2 秒后截止的申请；复核稍晚于截止时刻到达。
+CREATE16=$(curl -sS -X POST "${BASE_URL}/records" "${AUTH[@]}" -d '{
+  "text": "患者张三，身份证号 11010119903077777，联系电话 13800001111。",
+  "intervals": [{"start": 2, "end": 4}, {"start": 10, "end": 28}, {"start": 34, "end": 45}]
+}')
+RID16=$(echo "${CREATE16}" | jq -r .record_id)
+curl -sS -X PUT "${BASE_URL}/records/${RID16}/controlled" "${AUTH[@]}" >/dev/null
+OPEN16=$(date -u -d '10 seconds ago' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
+  || date -u -v-10S +%Y-%m-%dT%H:%M:%SZ)
+CLOSE16=$(date -u -d '2 seconds' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
+  || date -u -v+2S +%Y-%m-%dT%H:%M:%SZ)
+SUB16=$(curl -sS -X POST "${BASE_URL}/records/${RID16}/publish-requests" \
+  -u "alice:${ALICE_PW}" -H "Content-Type: application/json" -d "{
+    \"version\": 1, \"max_reads\": 2,
+    \"window_open_at\": \"${OPEN16}\", \"window_close_at\": \"${CLOSE16}\"}")
+REQ16=$(echo "${SUB16}" | jq -r .request_id)
+echo "申请冻结时段: $(echo "${SUB16}" | jq -c '{window_open_at,window_close_at}')"
+sleep 2.5   # 模拟复核在数据库行锁上等待，跨过冻结时段的截止时刻
+printf '截止后批准: HTTP %s\n' "$(code -X POST "${BASE_URL}/publish-requests/${REQ16}/approve" -u "bob:${BOB_PW}")"
+# => 409，且没有快照/令牌产生
+curl -sS "${BASE_URL}/records/${RID16}" "${AUTH[@]}" | jq '{snapshots}'
+curl -sS "${BASE_URL}/publish-requests/${REQ16}" -u "alice:${ALICE_PW}" \
+  | jq '{status, snapshot_id, window_close_at}'
+# => {"status":"pending","snapshot_id":null,...}
+echo "申请仍待审，改走驳回:"
+curl -sS -X POST "${BASE_URL}/publish-requests/${REQ16}/reject" \
+  -u "bob:${BOB_PW}" -H "Content-Type: application/json" -d '{"reason":"时段已截止"}' \
+  | jq '{request_id, status, reason}'
 
 printf '\n\033[1m受控发布演示完成。\033[0m\n'

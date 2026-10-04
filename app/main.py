@@ -1011,9 +1011,15 @@ def approve_publish_request(
     申请人不得复核；已终态（批准/驳回）的申请一律 409；
     行锁串行化并发复核，保证同一申请只有一个终态。
 
-    申请冻结了外部阅览时段时：截止时刻已到则拒绝批准（409），申请保持待审、
-    仍可驳回；时段与同版本快照首次发布已有时段不同则 409，绝不改写快照；
-    申请未带时段则沿用快照既有时段（首次设置或仍为无限制）。
+    一切到点判定（定时撤回计划是否到点、冻结阅览时段是否截止）都以**取得申请行、
+    敏感词清单行、快照行等全部相关行锁之后**的服务端时刻为准：等待行锁期间跨过
+    计划生效时刻或时段截止时刻时，绝不沿用等待前取得的旧时刻。
+    - 定时撤回计划已到点：在快照行锁内按预定时刻与计划原因完成撤回并提交，
+      返回 409，申请保持待审、仍可驳回，不签发令牌；
+    - 冻结阅览时段已截止：回滚本次未落库的快照插入，返回 409，不生成快照或
+      令牌，申请保持待审、仍可驳回；
+    - 时段与同版本快照首次发布已有时段不同则 409，绝不改写快照；申请未带时段
+      则沿用快照既有时段（首次设置或仍为无限制）。
     """
     # SELECT ... FOR UPDATE：并发复核在此排队，后进入者会看到已终态并被拒绝。
     # 不显式锁记录行：销毁不持记录行锁，二者仅在申请行上排队；插入新快照时
@@ -1052,22 +1058,6 @@ def approve_publish_request(
             "the request stays pending and may be rejected",
         )
 
-    # 快照与令牌在同一事务内生成：任一步失败整体回滚，不会留下可读令牌。
-    # 相对到期时长在签发时刻换算为绝对时刻；显式到期时刻沿用申请时的选择。
-    now = datetime.now(timezone.utc)
-    if request.token_expires_in_seconds is not None:
-        token_expires_at = now + timedelta(seconds=request.token_expires_in_seconds)
-    else:
-        token_expires_at = request.token_expires_at
-    # 外部阅览时段在申请提交时已冻结；批准时若截止时刻已到，拒绝批准：
-    # 不产生快照或令牌，申请保持待审、仍可被驳回。
-    if request.window_close_at is not None and request.window_close_at <= now:
-        db.rollback()
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="frozen reading window has already closed; "
-            "the request stays pending and may be rejected",
-        )
     frozen_intervals = [(iv["start"], iv["end"]) for iv in request.frozen_intervals]
     # 批准时用“当时启用”的清单重新核验申请冻结的原文与区间（清单可能已在等待
     # 期间变更）。先锁清单单行再锁快照行，锁序与直接发布一致、不会死锁；不通过
@@ -1093,8 +1083,15 @@ def approve_publish_request(
         )
         .with_for_update()
     ).scalar_one()
-    # 申请等待期间到点的定时撤回计划先结算：到点即撤回，不能批准重新公开（仍可驳回）。
-    # 结算先提交落库，再返回 409。
+    # 所有相关行锁（申请行、敏感词清单行、快照行）均已取得后，再取一次服务端
+    # 时刻用于一切到点判定：等待行锁期间可能跨过定时撤回计划的预定时刻或冻结
+    # 阅览时段的截止时刻，绝不能用等待前取得的旧时刻判定，否则可能在计划已到点、
+    # 时段已截止后仍批准并签发令牌。令牌相对到期时长也按此刻换算，复核等待不占用
+    # 令牌寿命。
+    now = datetime.now(timezone.utc)
+    # 申请等待期间到点的定时撤回计划先结算：到点即以预定时刻、计划原因完成撤回，
+    # 不能批准重新公开（申请仍待审、仍可驳回）。结算在快照行锁内先提交落库，
+    # 再返回 409；不签发任何令牌。
     _settle_snapshot_withdrawal_plans(db, snapshot, now)
     if snapshot.withdrawn_at is not None:
         db.commit()
@@ -1102,6 +1099,22 @@ def approve_publish_request(
             status_code=status.HTTP_409_CONFLICT,
             detail="snapshot of this version has been withdrawn",
         )
+    # 外部阅览时段在申请提交时已冻结；截止判定同样以获锁后的服务端时刻为准。
+    # 截止时刻已到则拒绝批准：回滚本次尚未落库的快照插入（既有快照不受影响），
+    # 不产生快照或令牌，申请保持待审、仍可被驳回。
+    if request.window_close_at is not None and request.window_close_at <= now:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="frozen reading window has already closed; "
+            "the request stays pending and may be rejected",
+        )
+    # 快照与令牌在同一事务内生成：任一步失败整体回滚，不会留下可读令牌。
+    # 相对到期时长在签发时刻换算为绝对时刻；显式到期时刻沿用申请时的选择。
+    if request.token_expires_in_seconds is not None:
+        token_expires_at = now + timedelta(seconds=request.token_expires_in_seconds)
+    else:
+        token_expires_at = request.token_expires_at
     # 快照时段只随首次发布确定：申请未带时段则沿用快照既有时段（首次设置或仍为
     # 无限制）；申请显式冻结的时段与快照既有时段不同则整次批准失败，绝不改写快照，
     # 申请保持待审、仍可驳回。

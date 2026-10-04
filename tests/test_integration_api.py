@@ -3963,6 +3963,225 @@ class SnapshotReadingWindowIntegrationTests(unittest.TestCase):
         self.assertIsNone(approve.json()["window_open_at"])
         self._read(sid, token)
 
+    # ---- 行锁等待跨过界限：到点判定一律以获锁后的服务端时刻为准 ----
+
+    def _block_settings_row_across_boundary(self, boundary_at, outcome, start, snapshot_id=None):
+        """独立事务按批准流程相同锁序持有“敏感词清单行 (+快照行)”FOR UPDATE，
+        跨过指定界限时刻后才提交。
+
+        批准流程在这些锁上排队，其“取服务端时刻做界限判定”的位置若放在等待前，
+        就会用到跨过界限之前的旧时刻；用以确定性复现行锁等待竞态。传入
+        snapshot_id 时一并持有快照行锁，阻止其他路径先对该快照做到期结算。
+        """
+        from sqlalchemy import select as sa_select
+
+        from app.db import SessionLocal
+        from app.models import SensitivePhraseSettings as SettingsModel
+        from app.models import Snapshot as SnapshotModel
+
+        db = SessionLocal()
+        try:
+            start.wait()
+            db.execute(
+                sa_select(SettingsModel)
+                .where(SettingsModel.id == app_main.SENSITIVE_PHRASE_SETTINGS_ID)
+                .with_for_update()
+            ).scalar_one()
+            if snapshot_id is not None:
+                db.execute(
+                    sa_select(SnapshotModel)
+                    .where(SnapshotModel.id == uuid.UUID(snapshot_id))
+                    .with_for_update()
+                ).scalar_one()
+            remaining = (boundary_at - datetime.now(timezone.utc)).total_seconds()
+            time.sleep(max(remaining, 0) + 0.9)
+            db.commit()
+            outcome["blocker"] = "committed"
+        except Exception as exc:  # pragma: no cover - 仅在异常时暴露
+            db.rollback()
+            outcome["blocker_error"] = repr(exc)
+        finally:
+            db.close()
+
+    def test_approval_waiting_on_row_lock_settles_due_plan_and_returns_409(self):
+        from app.db import SessionLocal
+        from app.models import PublishRequest as PRModel
+        from app.models import ReadToken as TokenModel
+        from app.models import Snapshot as SnapshotModel
+        from app.models import SnapshotWithdrawalPlan as PlanModel
+
+        self._mark_controlled()
+        # 申请 A 先批准，产生同版本快照（撤回计划必须挂在已存在的快照上）
+        first = self._submit_request({"version": 1, "max_reads": 5})
+        approve1 = self.client.post(
+            f"/publish-requests/{first.json()['request_id']}/approve", auth=BASIC_BOB
+        )
+        self.assertEqual(approve1.status_code, 200, approve1.text)
+        snapshot_id = approve1.json()["snapshot_id"]
+        # 申请 B 待审；为同版本快照登记一个很近的定时撤回计划
+        second = self._submit_request({"version": 1})
+        request_id = second.json()["request_id"]
+        due_at = datetime.now(timezone.utc) + timedelta(milliseconds=700)
+        plan = self.client.post(
+            "/snapshot-withdrawal-plans",
+            headers=SERVICE_HEADERS,
+            json={
+                "snapshot_id": snapshot_id,
+                "scheduled_at": due_at.isoformat(),
+                "reason": "等待期间到点的计划原因",
+            },
+        )
+        self.assertEqual(plan.status_code, 201, plan.text)
+        plan_id = plan.json()["plan_id"]
+
+        outcome: dict = {}
+        start = threading.Event()
+
+        def blocker():
+            # 同时持有清单行与快照行：既挡住批准流程的取时刻点，也阻止后台线程
+            # 用“新鲜时刻”抢先结算该快照的到期计划。
+            self._block_settings_row_across_boundary(
+                due_at, outcome, start, snapshot_id=snapshot_id
+            )
+
+        # 暂停后台到期结算线程：只保留批准事务本身的惰性结算路径，才能确定性地
+        # 暴露“等待前取得的旧时刻漏结算到期计划”这一缺陷。
+        app_main._withdrawal_scheduler.stop()
+        try:
+            t_block = threading.Thread(target=blocker)
+            t_approve = threading.Thread(
+                target=self._approve_request, args=(request_id, outcome)
+            )
+            t_block.start()
+            t_approve.start()
+            start.set()
+            t_block.join(timeout=15)
+            t_approve.join(timeout=15)
+        finally:
+            app_main._withdrawal_scheduler.start()
+        self.assertFalse(t_block.is_alive(), outcome)
+        self.assertFalse(t_approve.is_alive(), outcome)
+        self.assertEqual(outcome.get("blocker"), "committed", outcome)
+        # 获锁后计划已到点：409，绝不签发令牌
+        self.assertEqual(outcome.get("approve_status"), 409, outcome)
+
+        with SessionLocal() as session:
+            row = session.get(PRModel, uuid.UUID(request_id))
+            self.assertEqual(row.status, "pending")
+            self.assertIsNone(row.snapshot_id)
+            self.assertIsNone(row.decided_at)
+            plan_row = session.get(PlanModel, uuid.UUID(plan_id))
+            self.assertEqual(plan_row.status, "completed")
+            # 撤回时间取预定时刻、原因取计划原因（ended_at 与 scheduled_at 同一瞬间）
+            self.assertEqual(
+                plan_row.ended_at.replace(tzinfo=timezone.utc)
+                if plan_row.ended_at.tzinfo is None
+                else plan_row.ended_at,
+                due_at.astimezone(timezone.utc),
+            )
+            snapshot_row = session.get(SnapshotModel, uuid.UUID(snapshot_id))
+            self.assertIsNotNone(snapshot_row.withdrawn_at)
+            self.assertEqual(snapshot_row.withdraw_reason, "等待期间到点的计划原因")
+            tokens = (
+                session.query(TokenModel)
+                .filter(TokenModel.snapshot_id == uuid.UUID(snapshot_id))
+                .count()
+            )
+            # 仅申请 A 批准时签发的那一枚，申请 B 未签发
+            self.assertEqual(tokens, 1)
+        # 申请仍待审、可驳回
+        reject = self.client.post(
+            f"/publish-requests/{request_id}/reject",
+            auth=BASIC_BOB,
+            json={"reason": "计划已到点，改走驳回"},
+        )
+        self.assertEqual(reject.status_code, 200, reject.text)
+        self.assertEqual(reject.json()["status"], "rejected")
+
+    def _approve_request(self, request_id, outcome):
+        try:
+            r = self.client.post(
+                f"/publish-requests/{request_id}/approve", auth=BASIC_BOB
+            )
+            outcome["approve_status"] = r.status_code
+        except Exception as exc:  # pragma: no cover - 暴露跨线程异常
+            outcome["approve_error"] = repr(exc)
+
+    def test_approval_waiting_on_row_lock_past_window_close_returns_409_without_snapshot(self):
+        from app.db import SessionLocal
+        from app.models import PublishRequest as PRModel
+        from app.models import ReadToken as TokenModel
+        from app.models import Snapshot as SnapshotModel
+
+        self._mark_controlled()
+        now = datetime.now(timezone.utc)
+        close_at = now + timedelta(milliseconds=700)
+        submitted = self._submit_request(
+            {
+                "version": 1,
+                "max_reads": 3,
+                "window_open_at": _iso(now - timedelta(minutes=1)),
+                "window_close_at": _iso(close_at),
+            }
+        )
+        request_id = submitted.json()["request_id"]
+
+        outcome: dict = {}
+        start = threading.Event()
+
+        t_block = threading.Thread(
+            target=self._block_settings_row_across_boundary,
+            args=(close_at, outcome, start),
+        )
+        t_approve = threading.Thread(
+            target=self._approve_request, args=(request_id, outcome)
+        )
+        t_block.start()
+        t_approve.start()
+        start.set()
+        t_block.join(timeout=15)
+        t_approve.join(timeout=15)
+        self.assertFalse(t_block.is_alive(), outcome)
+        self.assertFalse(t_approve.is_alive(), outcome)
+        self.assertEqual(outcome.get("blocker"), "committed", outcome)
+        # 获锁后冻结时段已截止：409
+        self.assertEqual(outcome.get("approve_status"), 409, outcome)
+
+        with SessionLocal() as session:
+            row = session.get(PRModel, uuid.UUID(request_id))
+            self.assertEqual(row.status, "pending")
+            self.assertIsNone(row.snapshot_id)
+            snapshots = (
+                session.query(SnapshotModel)
+                .filter(SnapshotModel.record_id == uuid.UUID(self.record_id))
+                .all()
+            )
+            # 不生成快照或令牌
+            self.assertEqual(snapshots, [])
+            self.assertEqual(
+                session.query(TokenModel)
+                .filter(
+                    TokenModel.snapshot_id.in_(
+                        [s.id for s in snapshots]
+                    )
+                )
+                .count(),
+                0,
+            )
+        info = self.client.get(
+            f"/publish-requests/{request_id}", auth=BASIC_ALICE
+        ).json()
+        self.assertEqual(info["status"], "pending")
+        self.assertIsNone(info["snapshot_id"])
+        # 申请仍待审、可驳回
+        reject = self.client.post(
+            f"/publish-requests/{request_id}/reject",
+            auth=BASIC_BOB,
+            json={"reason": "时段已截止"},
+        )
+        self.assertEqual(reject.status_code, 200, reject.text)
+        self.assertEqual(reject.json()["status"], "rejected")
+
     # ---- 共享凭证：窗口按快照独立判定 ----
 
     def test_bundle_credential_window_blocks_one_snapshot_only(self):

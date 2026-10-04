@@ -265,7 +265,10 @@ WHERE tgrelid = 'read_audit_events'::regclass AND tgname LIKE 'trg_read_audit_ev
 - **到点即视为撤回**：生效时在同一事务把快照置为撤回——
   **撤回时间取预定时刻 `scheduled_at`、撤回原因取计划原因**，与手动撤回走同一终态
   （`snapshots.withdrawn_at/withdraw_reason`），此后该版本再次直接发布、提交受控
-  申请或批准撤回前在审申请等既有 `409` 规则全部沿用。
+  申请或批准撤回前在审申请等既有 `409` 规则全部沿用。受控发布**批准事务**在取得
+  申请行、敏感词清单行、快照行等全部相关行锁后才取服务端时刻做界限判定：若等待
+  行锁期间计划到点，则由批准事务在快照行锁内按预定时刻、计划原因完成撤回并先提交，
+  随后对该批准返回 `409`、不签发令牌（申请仍待审、可驳回）。
 - **重启/多实例不漏执行、不重复执行**：到期不依赖单点计时器。计划持久化在库中；
   每个 API 实例都有一个后台结算线程按 `WITHDRAWAL_SCHEDULE_POLL_SECONDS`（默认 1
   秒）扫描到期计划，同时**公开读取与所有持快照行锁的路径**（手动撤回、直接发布、
@@ -509,7 +512,8 @@ curl -sS -X POST http://localhost:8000/records/<RID>/publish-requests \
   -u alice:<ALICE_PW> -H "Content-Type: application/json" \
   -d '{"version":1,"window_open_at":"2026-10-03T08:00:00Z","window_close_at":"2026-10-04T00:00:00Z"}'
 # => 201 {"request_id":"<PRID>","status":"pending","window_open_at":"…","window_close_at":"…", ...}
-# 批准时截止已到 => 409（申请仍 pending，可 POST /publish-requests/<PRID>/reject 驳回）；
+# 批准时（含等待数据库行锁之后）截止已到 => 409（不生成快照或令牌；申请仍 pending，
+# 可 POST /publish-requests/<PRID>/reject 驳回）；
 # 申请时段与快照首次时段不一致 => 409（不改写快照，仍可驳回）。
 ```
 
@@ -634,6 +638,11 @@ curl -sS "$BASE/public/snapshots/<SID>?token=<TOKEN>"
    - 批准与驳回互斥：驳回后不能批准、批准后不能再驳回；对已终结申请再次操作 → `409`；
    - 并发复核由数据库行锁串行化，**同一申请只会产生一个终态**，落选方收到 `409`。
 4. **批准事务**：沿用既有脱敏（合并相交/相邻区间→`[已遮蔽]`）与令牌（`secrets.token_urlsafe(32)`、可选到期）规则，在**同一事务**内生成不可变快照、写入新读取令牌（携带申请时冻结的 `max_reads`）并终结申请；任何一步失败整体回滚，**不会留下可读令牌或计数**。冻结时段**截止已到**（`409`，申请仍待审、可驳回）或与同版本快照首次发布时段**不一致**（`409`，不改写快照、仍可驳回）时不批准；申请未带时段则沿用快照既有时段。详见“快照外部阅览时段”一节。
+   - **到点判定一律以取得相关行锁后的服务端时刻为准**：批准事务会依次取得申请行、敏感短语清单行、快照行的 `FOR UPDATE` 行锁。若复核在某把行锁上等待（例如并发的清单替换、撤回/销毁事务），等待期间跨过了定时撤回计划的预定时刻或冻结阅览时段的截止时刻，**绝不沿用等待前取得的旧服务端时刻**，而是在全部相关锁取得后重新取时刻判定：
+     - 定时撤回计划已到点：在快照行锁内**按预定时刻与计划原因完成撤回并先提交落库**（计划置 `completed`），随后批准返回 `409`，**不签发令牌**，申请仍为 `pending`、仍可驳回；
+     - 冻结阅览时段已截止：回滚本次未落库的快照插入，批准返回 `409`，**不生成快照或令牌**，申请仍为 `pending`、仍可驳回；
+     - 相对令牌到期时长（`expires_in_seconds`）同样按获锁后的时刻换算，复核等待不占用令牌寿命。
+   - 未跨过任何界限的批准：鉴权（申请人回避、角色）、按当时启用清单对冻结原文的敏感词重新核验（未覆盖命中 `422`）、冻结时段判定、令牌响应字段与“快照/令牌/申请终结同事务提交或整体回滚”的事务语义全部不变。
 5. **驳回**：只终结申请（可记录 `reason`），不生成快照、令牌或读取计数。
 6. **拒绝不泄露原文**：无凭据/凭据错误 → `401`，无角色 → `403`，未知记录/版本/申请 → `404`，已终结/入口错误 → `409`；申请查询只返回元数据（含 `token_max_reads`），冻结原文绝不离开服务端。
 7. 批准签发的令牌与直接发布令牌完全一致：遵守 `max_reads` 次数上限与到期规则，可用 `POST /tokens/{token}/revoke` 撤销，可用 `GET /tokens/{token}` 查询已用/剩余次数。
@@ -694,6 +703,39 @@ curl -sS http://localhost:8000/publish-requests/<PRID> -u alice:alice-pw
 curl -sS http://localhost:8000/records/<RID>/publish-requests -u alice:alice-pw
 ```
 
+#### 行锁等待跨过界限时的批准（本轮修复点）
+
+复核事务在申请行/敏感词清单行/快照行上排队时，若等待跨过了某个界限，批准
+按**获锁后的服务端时刻**重新判定，返回 `409` 且申请保持 `pending`（可驳回）：
+
+```bash
+# 情形 A：同版本快照存在“等待期间到点”的定时撤回计划。
+# 到点撤回按预定时刻与计划原因落库（无需后台线程介入，批准事务的惰性结算即完成）：
+curl -sS -X POST http://localhost:8000/publish-requests/<PRID>/approve -u bob:bob-pw
+# => 409 {"detail":"snapshot of this version has been withdrawn"}
+# 快照侧：status=withdrawn、withdrawn_at=计划 scheduled_at、withdraw_reason=计划原因；
+# 计划侧：status=completed、ended_at=scheduled_at；申请仍 pending、snapshot_id=null，
+# 且本次没有签发任何新令牌。申请仍可驳回：
+curl -sS -X POST http://localhost:8000/publish-requests/<PRID>/reject \
+  -u bob:bob-pw -H "Content-Type: application/json" -d '{"reason":"计划已到点，改走驳回"}'
+# => {"request_id":"<PRID>","status":"rejected",...}
+
+# 情形 B：申请冻结的外部阅览时段在等待期间截止（快照尚不存在也不会被创建）：
+curl -sS -X POST http://localhost:8000/publish-requests/<PRID_WIN>/approve -u bob:bob-pw
+# => 409 {"detail":"frozen reading window has already closed; the request stays pending and may be rejected"}
+# 不生成快照或令牌；申请仍 pending、snapshot_id=null，可驳回或（如重新提交带未来
+# 时段的新申请）继续走流程。
+curl -sS http://localhost:8000/publish-requests/<PRID_WIN> -u alice:alice-pw
+# => {"status":"pending","snapshot_id":null,"window_open_at":"…","window_close_at":"…",...}
+
+# 未跨过任何界限的批准：响应与事务语义不变（200 + snapshot_id/token/expires_at/...）。
+```
+
+> 说明：定时撤回后台结算线程只做到期兜底；即使计划恰在复核等待期间到点且由
+> 批准事务本身完成结算，撤回时间仍取**预定时刻**、原因取**计划原因**，与后台/
+> 其他请求路径结算的结果完全一致（行锁 + 仅命中 `pending` 计划保证恰好生效一次）。
+
+
 完整受控流程演示（含 401/403/404/409、冻结内容与 `max_reads`、申请人回避、并发复核终态唯一、次数用尽与撤销）：
 
 ```bash
@@ -708,7 +750,7 @@ curl -sS http://localhost:8000/records/<RID>/publish-requests -u alice:alice-pw
 | 已认证但缺少所需角色（operator/reviewer） | `403` |
 | 申请人复核自己的申请 | `403` |
 | 未知记录 / 版本 / 申请 | `404` |
-| 受控记录直接发布、非受控记录提交申请、对已终结申请再操作、提交/批准命中已撤回版本、令牌到期时间非法 | `409` / `422` |
+| 受控记录直接发布、非受控记录提交申请、对已终结申请再操作、提交/批准命中已撤回版本（含批准等待期间到点的定时撤回计划）、批准时冻结阅览时段已截止、令牌到期时间非法 | `409` / `422` |
 
 ## 多快照共享凭证（一次把多个快照交给同一外部审阅者）
 

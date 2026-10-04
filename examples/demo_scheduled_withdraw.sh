@@ -4,12 +4,15 @@
 #   查询计划 -> 重复提交相同内容回放原计划（replayed=true）-> 改时间须先取消（409）->
 #   取消后重新安排一个 3 秒后生效的计划 -> 到点自动撤回（后台结算）->
 #   公开读取沿用模糊 403，不扣令牌次数、不写成功审计 -> 手动撤回只回放首次结果，不能改原因 ->
-#   再演示“手动撤回先发生”：计划终止为 superseded，撤回时间与原因以手动为准
+#   再演示“手动撤回先发生”：计划终止为 superseded，撤回时间与原因以手动为准 ->
+#   受控复核等待期间计划到点：批准事务按预定时刻/计划原因撤回并 409，不签发令牌、仍可驳回
 # 依赖：curl、jq
 set -euo pipefail
 
 BASE_URL="${BASE_URL:-http://localhost:8000}"
 SERVICE_KEY="${SERVICE_KEY:-dev-service-key-change-me}"
+ALICE_PW="${ALICE_PW:-alice-pw}"   # operator（申请人）
+BOB_PW="${BOB_PW:-bob-pw}"         # reviewer（复核人）
 AUTH=(-H "X-Service-Key: ${SERVICE_KEY}" -H "Content-Type: application/json")
 
 step() { printf '\n\033[1m== %s ==\033[0m\n' "$1"; }
@@ -129,5 +132,40 @@ curl -sS "${BASE_URL}/snapshot-withdrawal-plans/${PLAN3_ID}" "${AUTH[@]}" | jq .
 echo "快照撤回时间与原因以手动为准:"
 curl -sS "${BASE_URL}/records/${RID2}" "${AUTH[@]}" \
   | jq '.snapshots[0] | {status, withdrawn_at, withdraw_reason}'
+
+step "13. 受控复核等待期间计划到点：按预定时刻/计划原因撤回，批准 409、不签发令牌、申请仍可驳回"
+# 受控记录：申请 A 先批准产生快照，在该快照上安排 2 秒后到点的撤回计划；
+# 待审申请 B 的复核跨过到点时刻（生产中通常是在申请行/清单行/快照行锁上等待）。
+PUB4=$(curl -sS -X POST "${BASE_URL}/records" "${AUTH[@]}" -d '{
+  "text": "受控记录示例，内容用于复核到点撤回。", "intervals": [{"start": 0, "end": 3}]}')
+RID3=$(echo "${PUB4}" | jq -r .record_id)
+curl -sS -X PUT "${BASE_URL}/records/${RID3}/controlled" "${AUTH[@]}" >/dev/null
+SUB_A=$(curl -sS -X POST "${BASE_URL}/records/${RID3}/publish-requests" \
+  -u "alice:${ALICE_PW}" -H "Content-Type: application/json" -d '{"version": 1, "max_reads": 5}')
+PR_A=$(echo "${SUB_A}" | jq -r .request_id)
+APP_A=$(curl -sS -X POST "${BASE_URL}/publish-requests/${PR_A}/approve" -u "bob:${BOB_PW}")
+SID3=$(echo "${APP_A}" | jq -r .snapshot_id)
+SUB_B=$(curl -sS -X POST "${BASE_URL}/records/${RID3}/publish-requests" \
+  -u "alice:${ALICE_PW}" -H "Content-Type: application/json" -d '{"version": 1}')
+PR_B=$(echo "${SUB_B}" | jq -r .request_id)
+DUE3=$(date -u -d '+2 seconds' +%Y-%m-%dT%H:%M:%SZ)
+PLAN4=$(curl -sS -X POST "${BASE_URL}/snapshot-withdrawal-plans" "${AUTH[@]}" -d "{
+  \"snapshot_id\": \"${SID3}\",
+  \"scheduled_at\": \"${DUE3}\",
+  \"reason\": \"复核等待期间到点的计划原因\"}")
+PLAN4_ID=$(echo "${PLAN4}" | jq -r .plan_id)
+sleep 2.5   # 模拟复核在数据库行锁上等待，跨过计划预定时刻
+printf '到点后批准: HTTP %s（不签发令牌）\n' \
+  "$(code -X POST "${BASE_URL}/publish-requests/${PR_B}/approve" -u "bob:${BOB_PW}")"
+# => 409 {"detail":"snapshot of this version has been withdrawn"}
+echo "计划已按预定时刻/计划原因完成撤回（ended_at=scheduled_at）:"
+curl -sS "${BASE_URL}/snapshot-withdrawal-plans/${PLAN4_ID}" "${AUTH[@]}" \
+  | jq '{plan_id, status, scheduled_at, ended_at, withdrawn_at, reason}'
+echo "申请 B 仍待审、无快照/令牌关联，可驳回:"
+curl -sS "${BASE_URL}/publish-requests/${PR_B}" -u "alice:${ALICE_PW}" \
+  | jq '{status, snapshot_id, reviewed_by}'
+curl -sS -X POST "${BASE_URL}/publish-requests/${PR_B}/reject" \
+  -u "bob:${BOB_PW}" -H "Content-Type: application/json" \
+  -d '{"reason":"计划已到点，改走驳回"}' | jq '{request_id, status, reason}'
 
 printf '\n\033[1m快照定时撤回演示完成。\033[0m\n'
