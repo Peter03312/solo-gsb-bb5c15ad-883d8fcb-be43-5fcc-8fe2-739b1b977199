@@ -1096,6 +1096,181 @@ class ControlledPublishIntegrationTests(unittest.TestCase):
             self.assertIsNotNone(row.withdrawn_at)
             self.assertEqual(row.withdraw_reason, "误发，撤回")
 
+    # ---- 行锁等待跨过界限：批准必须以获锁后的服务端时刻判定 ----
+
+    def _record_snapshots_direct(self):
+        """直接查库返回本记录的全部快照（用于验证 409 拒绝未留下快照）。"""
+        from app.db import SessionLocal
+        from app.models import Snapshot as SnapshotModel
+
+        with SessionLocal() as session:
+            rows = (
+                session.query(SnapshotModel)
+                .filter(SnapshotModel.record_id == self.record_id)
+                .all()
+            )
+            return [
+                {
+                    "snapshot_id": str(row.id),
+                    "status": "withdrawn" if row.withdrawn_at is not None else "published",
+                }
+                for row in rows
+            ]
+
+    def _hold_rows_in_worker(self, hold_settings=False, snapshot_id=None, delay=1.3):
+        """在工作线程事务中持有清单行/快照行 FOR UPDATE 锁 delay 秒后提交。"""
+        from sqlalchemy import text as sql_text
+
+        from app.db import SessionLocal
+
+        acquired = threading.Event()
+
+        def hold():
+            session = SessionLocal()
+            try:
+                if hold_settings:
+                    session.execute(
+                        sql_text(
+                            "SELECT id FROM sensitive_phrase_settings "
+                            "WHERE id = 1 FOR UPDATE"
+                        )
+                    )
+                if snapshot_id is not None:
+                    session.execute(
+                        sql_text("SELECT id FROM snapshots WHERE id = :sid FOR UPDATE"),
+                        {"sid": str(snapshot_id)},
+                    )
+                acquired.set()
+                time.sleep(delay)
+                session.commit()
+            except Exception:  # pragma: no cover - 仅在异常时暴露
+                session.rollback()
+                raise
+            finally:
+                session.close()
+
+        thread = threading.Thread(target=hold)
+        thread.start()
+        self.assertTrue(acquired.wait(timeout=5), "协调线程未能在预期时间内取得行锁")
+        return thread
+
+    def test_approval_waiting_on_settings_lock_past_window_close_is_409_and_pending(self):
+        """等待清单行锁期间冻结时段截止：批准 409，不产生快照/令牌，申请仍可驳回。"""
+        self._mark_controlled()
+        now = datetime.now(timezone.utc)
+        close_at = now + timedelta(milliseconds=800)
+        r = self._submit(
+            expires={
+                "window_open_at": _iso(now - timedelta(seconds=10)),
+                "window_close_at": _iso(close_at),
+            }
+        )
+        request_id = r.json()["request_id"]
+        # 清单行锁从批准前持有到时段截止之后：旧实现用等待前的时刻判定而错误签发。
+        holder = self._hold_rows_in_worker(hold_settings=True)
+        a = self.client.post(
+            f"/publish-requests/{request_id}/approve", auth=BASIC_BOB
+        )
+        holder.join(timeout=10)
+        self.assertFalse(holder.is_alive())
+        self.assertEqual(a.status_code, 409, a.text)
+        # 不产生快照或令牌：回查本记录无任何快照，申请未绑定快照
+        self.assertEqual(self._record_snapshots_direct(), [])
+        info = self.client.get(
+            f"/publish-requests/{request_id}", auth=BASIC_ALICE
+        ).json()
+        self.assertEqual(info["status"], "pending")
+        self.assertIsNone(info["snapshot_id"])
+        # 申请保持待审、仍可驳回
+        rej = self.client.post(
+            f"/publish-requests/{request_id}/reject",
+            auth=BASIC_BOB,
+            json={"reason": "等待锁期间时段已截止"},
+        )
+        self.assertEqual(rej.status_code, 200, rej.text)
+        self.assertEqual(rej.json()["status"], "rejected")
+
+    def test_approval_waiting_past_plan_due_settles_then_conflicts_and_issues_no_token(self):
+        """等待行锁期间定时撤回计划到点：先按预定时刻/计划原因撤回并提交，再 409。"""
+        from sqlalchemy import select as sa_select
+
+        from app.db import SessionLocal
+        from app.models import ReadToken as ReadTokenModel
+        from app.models import Snapshot as SnapshotModel
+
+        self._mark_controlled()
+        # 先经另一申请批准产生快照（无时段），待审申请批准时复用同一快照行
+        other = self._submit()
+        other_id = self._latest_request_id_from_list()
+        approved = self.client.post(
+            f"/publish-requests/{other_id}/approve", auth=BASIC_BOB
+        )
+        self.assertEqual(approved.status_code, 200, approved.text)
+        sid = approved.json()["snapshot_id"]
+        pending = self._submit(expires={"max_reads": 3})
+        pending_id = pending.json()["request_id"]
+        target = datetime.now(timezone.utc) + timedelta(milliseconds=800)
+        plan = self.client.post(
+            "/snapshot-withdrawal-plans",
+            headers=SERVICE_HEADERS,
+            json={
+                "snapshot_id": sid,
+                "scheduled_at": _iso(target),
+                "reason": "锁等待期间到点撤回",
+            },
+        )
+        self.assertEqual(plan.status_code, 201, plan.text)
+        plan_id = plan.json()["plan_id"]
+        # 停掉后台结算；协调线程同时持有清单行与快照行锁直到计划到点之后，
+        # 使“到点”只能由批准事务在获锁后结算（旧实现以等待前时刻判定而错误签发）。
+        app_main._withdrawal_scheduler.stop()
+        try:
+            holder = self._hold_rows_in_worker(hold_settings=True, snapshot_id=sid)
+            a = self.client.post(
+                f"/publish-requests/{pending_id}/approve", auth=BASIC_BOB
+            )
+            holder.join(timeout=10)
+            self.assertFalse(holder.is_alive())
+        finally:
+            app_main._withdrawal_scheduler.start()
+        self.assertEqual(a.status_code, 409, a.text)
+        # 计划已按预定时刻与计划原因完成撤回（随 409 一并提交）
+        got = self.client.get(
+            f"/snapshot-withdrawal-plans/{plan_id}", headers=SERVICE_HEADERS
+        ).json()
+        self.assertEqual(got["status"], "completed")
+        withdrawn_at = datetime.fromisoformat(got["withdrawn_at"])
+        self.assertLess(abs((withdrawn_at - target).total_seconds()), 2.0)
+        snap = self.client.get(
+            f"/records/{self.record_id}", headers=SERVICE_HEADERS
+        ).json()["snapshots"][0]
+        self.assertEqual(snap["status"], "withdrawn")
+        self.assertEqual(snap["withdraw_reason"], "锁等待期间到点撤回")
+        # 本次批准未签发新令牌（仅另一申请批准时的一枚），申请仍待审、可驳回
+        with SessionLocal() as session:
+            token_count = (
+                session.query(ReadTokenModel)
+                .filter(ReadTokenModel.snapshot_id.in_(
+                    sa_select(SnapshotModel.id).where(
+                        SnapshotModel.record_id == self.record_id
+                    )
+                ))
+                .count()
+            )
+        self.assertEqual(token_count, 1)
+        info = self.client.get(
+            f"/publish-requests/{pending_id}", auth=BASIC_ALICE
+        ).json()
+        self.assertEqual(info["status"], "pending")
+        self.assertIsNone(info["snapshot_id"])
+        rej = self.client.post(
+            f"/publish-requests/{pending_id}/reject",
+            auth=BASIC_BOB,
+            json={"reason": "版本已按计划撤回"},
+        )
+        self.assertEqual(rej.status_code, 200, rej.text)
+        self.assertEqual(rej.json()["status"], "rejected")
+
 
 @unittest.skipIf(SKIP_INTEGRATION, _SKIP_REASON)
 class ReadBundleIntegrationTests(unittest.TestCase):

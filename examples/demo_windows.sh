@@ -125,6 +125,8 @@ curl -sS "${BASE_URL}/publish-requests/${REQ}" -u "alice:${ALICE_PW}" \
   | jq '{status, window_open_at, window_close_at, snapshot_id}'
 echo "等待冻结窗口关闭后再批准……"
 sleep 3
+# 界限以批准事务取齐申请行/清单行/快照行锁之后的服务端时刻判定：
+# 即使批准请求在数据库行锁上等待并跨过截止时刻，获锁后仍会按新时刻 409 拒绝。
 printf '截止后批准: HTTP %s（拒绝批准）\n' \
   "$(code -X POST "${BASE_URL}/publish-requests/${REQ}/approve" -u "bob:${BOB_PW}")"
 echo "申请仍待审，可由复核人驳回："

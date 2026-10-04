@@ -1011,6 +1011,13 @@ def approve_publish_request(
     申请人不得复核；已终态（批准/驳回）的申请一律 409；
     行锁串行化并发复核，保证同一申请只有一个终态。
 
+    所有与“当前服务端时刻”有关的判定（定时撤回计划是否到点、冻结阅览时段是否
+    截止、令牌到期换算、申请终结时刻）一律以**取得相关行锁之后**取得的服务端
+    时刻 now 为准：申请行锁等待可能跨过计划生效或时段截止，绝不能用等待前的
+    时刻做判定。计划到点时先在快照行锁内按预定时刻与计划原因完成撤回结算并
+    提交，再返回 409（申请仍待审、可驳回，不签发令牌）；冻结时段已截止时同样
+    409 且不生成快照或令牌，申请保持待审。
+
     申请冻结了外部阅览时段时：截止时刻已到则拒绝批准（409），申请保持待审、
     仍可驳回；时段与同版本快照首次发布已有时段不同则 409，绝不改写快照；
     申请未带时段则沿用快照既有时段（首次设置或仍为无限制）。
@@ -1051,29 +1058,18 @@ def approve_publish_request(
             detail="frozen original text of this publish request has been destroyed; "
             "the request stays pending and may be rejected",
         )
-
-    # 快照与令牌在同一事务内生成：任一步失败整体回滚，不会留下可读令牌。
-    # 相对到期时长在签发时刻换算为绝对时刻；显式到期时刻沿用申请时的选择。
-    now = datetime.now(timezone.utc)
-    if request.token_expires_in_seconds is not None:
-        token_expires_at = now + timedelta(seconds=request.token_expires_in_seconds)
-    else:
-        token_expires_at = request.token_expires_at
-    # 外部阅览时段在申请提交时已冻结；批准时若截止时刻已到，拒绝批准：
-    # 不产生快照或令牌，申请保持待审、仍可被驳回。
-    if request.window_close_at is not None and request.window_close_at <= now:
-        db.rollback()
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="frozen reading window has already closed; "
-            "the request stays pending and may be rejected",
-        )
     frozen_intervals = [(iv["start"], iv["end"]) for iv in request.frozen_intervals]
-    # 批准时用“当时启用”的清单重新核验申请冻结的原文与区间（清单可能已在等待
-    # 期间变更）。先锁清单单行再锁快照行，锁序与直接发布一致、不会死锁；不通过
-    # 则整次拒绝：不产生快照或令牌，申请保持待审且仍可驳回。
-    _verify_phrases_cover_text(db, request.frozen_text, frozen_intervals)
+
+    # 先取锁、后取时：申请行锁可能等待了任意时长，任何“到点/截止”判定都必须
+    # 在全部相关行锁到手之后再读服务端时钟。锁序恒为“申请行 → 清单行 → 快照行”，
+    # 其中“清单行 → 快照行”与直接发布同序，不引入新的死锁环。
+    # 清单行（固定锁序的第一把）：批准时用“获锁当时启用”的清单重新核验申请
+    # 冻结的原文与区间（清单可能已在锁等待期间变更），行锁持有到本次提交/回滚。
+    settings_row = _lock_sensitive_phrase_settings(db)
     redacted = redact_text(request.frozen_text, frozen_intervals)
+    # 快照按 (record_id, version) 唯一：快照行锁是计划到点结算与撤回状态判定的
+    # 串行点，必须先把快照行确定并锁住，再做任何基于当前时刻的判定。INSERT 与
+    # 随后的 FOR UPDATE 在同一事务内，冲突时 on_conflict_do_nothing 复用既存行。
     db.execute(
         pg_insert(Snapshot)
         .values(
@@ -1093,8 +1089,12 @@ def approve_publish_request(
         )
         .with_for_update()
     ).scalar_one()
-    # 申请等待期间到点的定时撤回计划先结算：到点即撤回，不能批准重新公开（仍可驳回）。
-    # 结算先提交落库，再返回 409。
+    # 此刻起持有全部相关行锁（申请行、清单行、快照行）：now 是本次批准唯一
+    # 有效的服务端判定时刻，计划到点、时段截止、到期换算与终结时刻都用它。
+    now = datetime.now(timezone.utc)
+    # 申请等待锁期间到点的定时撤回计划先在快照行锁内结算：到点即以**预定时刻**
+    # 为撤回时间、以**计划原因**完成撤回（与手动撤回走同一终态），不能批准
+    # 重新公开。结算先提交落库，再返回 409；申请保持待审、仍可驳回，不签发令牌。
     _settle_snapshot_withdrawal_plans(db, snapshot, now)
     if snapshot.withdrawn_at is not None:
         db.commit()
@@ -1102,6 +1102,23 @@ def approve_publish_request(
             status_code=status.HTTP_409_CONFLICT,
             detail="snapshot of this version has been withdrawn",
         )
+    # 外部阅览时段在申请提交时已冻结；以获锁后的 now 判定截止时刻是否已到：
+    # 已到则拒绝批准——回滚本次尚未提交的快照 INSERT，不产生快照或令牌，
+    # 申请保持待审、仍可被驳回。
+    if request.window_close_at is not None and request.window_close_at <= now:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="frozen reading window has already closed; "
+            "the request stays pending and may be rejected",
+        )
+    # 在已锁定的清单版本上核验冻结原文与区间；不通过则整次拒绝（回滚本次快照
+    # INSERT 与全部锁）：不产生快照或令牌，申请保持待审且仍可驳回。
+    try:
+        _verify_against_settings(settings_row, request.frozen_text, frozen_intervals)
+    except HTTPException:
+        db.rollback()
+        raise
     # 快照时段只随首次发布确定：申请未带时段则沿用快照既有时段（首次设置或仍为
     # 无限制）；申请显式冻结的时段与快照既有时段不同则整次批准失败，绝不改写快照，
     # 申请保持待审、仍可驳回。
@@ -1111,6 +1128,12 @@ def approve_publish_request(
         requested_open_at=request.window_open_at,
         requested_close_at=request.window_close_at,
     )
+    # 快照与令牌在同一事务内生成：任一步失败整体回滚，不会留下可读令牌。
+    # 相对到期时长在签发时刻（获锁后的 now）换算为绝对时刻；显式到期时刻沿用申请时的选择。
+    if request.token_expires_in_seconds is not None:
+        token_expires_at = now + timedelta(seconds=request.token_expires_in_seconds)
+    else:
+        token_expires_at = request.token_expires_at
     token = ReadToken(
         token=secrets.token_urlsafe(32),
         snapshot_id=snapshot.id,
